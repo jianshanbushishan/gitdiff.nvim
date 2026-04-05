@@ -29,6 +29,27 @@ local state = {
 
 local closing = false
 
+local compare_buffer_options = {
+  "filetype",
+  "binary",
+  "endofline",
+  "fixendofline",
+  "bomb",
+  "fileformat",
+}
+
+local commands = {
+  diff_on = "silent! diffthis",
+  diff_off = "silent! diffoff!",
+  no_diff = "setlocal nodiff",
+}
+
+local git_commands = {
+  inside_work_tree = { "git", "rev-parse", "--is-inside-work-tree" },
+  show_toplevel = { "git", "rev-parse", "--show-toplevel" },
+  show_head = { "git", "show" },
+}
+
 -------------------------------------------------------------------------------
 -- Helpers
 -------------------------------------------------------------------------------
@@ -45,7 +66,6 @@ local function is_valid_buf(bufnr)
   return bufnr ~= nil and vim.api.nvim_buf_is_valid(bufnr)
 end
 
-
 --- Check if the current buffer is inside a Git work tree
 ---@return boolean
 local function is_in_git_repo()
@@ -53,34 +73,57 @@ local function is_in_git_repo()
   if filepath == "" then
     return false
   end
+
   local dir = vim.fn.fnamemodify(filepath, ":h")
-  local handle = io.popen(string.format("git -C %s rev-parse --is-inside-work-tree", dir))
-  if not handle then
-    return false
-  end
-  local result = handle:read("*a")
-  handle:close()
-  return result:match("true") ~= nil
+  local result = vim.system(git_commands.inside_work_tree, { cwd = dir, text = true }):wait()
+  return result.code == 0 and vim.trim(result.stdout or "") == "true"
 end
 
+---@param bufnr integer
 ---@return string|nil
-local function get_git_repo_root()
-  local filepath = vim.api.nvim_buf_get_name(0)
+local function get_buf_path(bufnr)
+  local filepath = vim.api.nvim_buf_get_name(bufnr)
   if filepath == "" then
     return nil
   end
-  local dir = vim.fn.fnamemodify(filepath, ":h")
-  local handle = io.popen(string.format("git -C %s rev-parse --show-toplevel", dir))
-  if not handle then
+
+  return filepath
+end
+
+---@param filepath string
+---@return string
+local function get_parent_dir(filepath)
+  return vim.fn.fnamemodify(filepath, ":h")
+end
+
+---@param cwd string
+---@param args string[]
+---@return vim.SystemCompleted
+local function run_git(cwd, args)
+  return vim.system(args, { cwd = cwd, text = true }):wait()
+end
+
+---@param filepath string
+---@return string|nil
+local function get_git_repo_root(filepath)
+  local result = run_git(get_parent_dir(filepath), git_commands.show_toplevel)
+  if result.code ~= 0 then
     return nil
   end
-  local result = handle:read("*a")
-  handle:close()
-  result = vim.trim(result)
-  if result == "" then
+
+  local root = vim.trim(result.stdout or "")
+  if root == "" then
     return nil
   end
-  return result
+
+  return root
+end
+
+---@param filepath string
+---@param base string
+---@return string
+local function make_relative_path(filepath, base)
+  return vim.fs.relpath(base, filepath):gsub("\\", "/")
 end
 
 --- Get the content of the current file at HEAD
@@ -91,18 +134,26 @@ local function get_git_head_content()
     return nil
   end
 
-  local filepath = vim.api.nvim_buf_get_name(0)
-  local rel_path = vim.fn.fnamemodify(filepath, ":."):gsub("\\", "/")
+  local filepath = get_buf_path(0)
+  if not filepath then
+    return nil
+  end
 
-  local handle = io.popen(string.format("git show HEAD:%s", rel_path))
-  if not handle then
+  local repo_root = get_git_repo_root(filepath)
+  if not repo_root then
+    vim.notify("[gitdiff] 无法获取 Git 仓库根目录", vim.log.levels.ERROR)
+    return nil
+  end
+
+  local rel_path = make_relative_path(filepath, repo_root)
+  local result = run_git(repo_root, { git_commands.show_head[1], git_commands.show_head[2], "HEAD:" .. rel_path })
+
+  if result.code ~= 0 then
     vim.notify("[gitdiff] 无法执行 git show", vim.log.levels.ERROR)
     return nil
   end
 
-  local content = handle:read("*a")
-  handle:close()
-  return content
+  return result.stdout
 end
 
 --- Write content to a temp file preserving the original file extension
@@ -111,16 +162,7 @@ end
 ---@param source_bufnr integer
 ---@param compare_bufnr integer
 local function sync_compare_buffer_options(source_bufnr, compare_bufnr)
-  local options = {
-    "filetype",
-    "binary",
-    "endofline",
-    "fixendofline",
-    "bomb",
-    "fileformat",
-  }
-
-  for _, option in ipairs(options) do
+  for _, option in ipairs(compare_buffer_options) do
     local ok, value = pcall(vim.api.nvim_get_option_value, option, { buf = source_bufnr })
     if ok then
       pcall(vim.api.nvim_set_option_value, option, value, { buf = compare_bufnr })
@@ -138,10 +180,63 @@ local function reset_state()
   state.mode = nil
 end
 
+---@param mode "git"|"file"|nil
+---@return boolean
+local function is_active_mode(mode)
+  return state.active and state.mode == mode
+end
+
+---@param win integer
+---@param callback fun()
+local function with_win_call(win, callback)
+  if not is_valid_win(win) then
+    return
+  end
+
+  pcall(vim.api.nvim_win_call, win, callback)
+end
+
+---@param win integer
+---@param cmd string
+local function win_cmd(win, cmd)
+  with_win_call(win, function()
+    vim.cmd(cmd)
+  end)
+end
+
+---@param winids integer[]
+---@param cmd string
+local function win_cmd_each(winids, cmd)
+  for _, win in ipairs(winids) do
+    win_cmd(win, cmd)
+  end
+end
+
+---@param source_bufnr integer
+---@param source_winid integer
+---@param compare_bufnr integer
+---@param compare_winid integer
+---@param mode "git"|"file"
+local function set_active_session(source_bufnr, source_winid, compare_bufnr, compare_winid, mode)
+  state.source_bufnr = source_bufnr
+  state.source_winid = source_winid
+  state.compare_bufnr = compare_bufnr
+  state.compare_winid = compare_winid
+  state.active = true
+  state.mode = mode
+end
+
 local function cleanup_temp_file()
   if state.temp_file and type(state.temp_file) == "string" and vim.fn.filereadable(state.temp_file) == 1 then
     os.remove(state.temp_file)
   end
+end
+
+---@param compare_bufnr integer
+local function configure_git_compare_buffer(compare_bufnr)
+  vim.api.nvim_set_option_value("readonly", true, { buf = compare_bufnr })
+  vim.api.nvim_set_option_value("modifiable", false, { buf = compare_bufnr })
+  vim.api.nvim_set_option_value("buflisted", false, { buf = compare_bufnr })
 end
 
 ---@param source_bufnr integer
@@ -167,35 +262,20 @@ end
 
 ---@param win integer
 local function clear_diff_for_win(win)
-  if not is_valid_win(win) then
-    return
-  end
-  pcall(vim.api.nvim_win_call, win, function()
-    vim.cmd("silent! diffoff!")
-    vim.cmd("setlocal nodiff")
-  end)
+  win_cmd(win, commands.diff_off)
+  win_cmd(win, commands.no_diff)
 end
 
 local function reset_tab_diff_state()
-  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
-    if is_valid_win(win) then
-      pcall(vim.api.nvim_win_call, win, function()
-        vim.cmd("silent! diffoff!")
-        vim.cmd("setlocal nodiff")
-      end)
-    end
-  end
+  local wins = vim.api.nvim_tabpage_list_wins(0)
+  win_cmd_each(wins, commands.diff_off)
+  win_cmd_each(wins, commands.no_diff)
 end
 
 ---@param source_win integer
 ---@param compare_win integer
 local function enable_diff_pair(source_win, compare_win)
-  vim.api.nvim_win_call(source_win, function()
-    vim.cmd("silent! diffthis")
-  end)
-  vim.api.nvim_win_call(compare_win, function()
-    vim.cmd("silent! diffthis")
-  end)
+  win_cmd_each({ source_win, compare_win }, commands.diff_on)
 end
 
 local function close_session()
@@ -229,6 +309,33 @@ local function close_session()
   closing = false
 end
 
+---@param source_bufnr integer
+---@param content string
+---@param compare_winid integer
+---@return integer|nil
+local function open_git_compare_buffer(source_bufnr, content, compare_winid)
+  local tmp = write_temp_file(source_bufnr, content)
+  if not tmp then
+    pcall(vim.api.nvim_win_close, compare_winid, true)
+    return nil
+  end
+
+  state.temp_file = tmp
+  vim.cmd("edit " .. vim.fn.fnameescape(tmp))
+
+  local compare_bufnr = vim.api.nvim_get_current_buf()
+  sync_compare_buffer_options(source_bufnr, compare_bufnr)
+  configure_git_compare_buffer(compare_bufnr)
+  return compare_bufnr
+end
+
+---@param compare_target string
+---@return integer
+local function open_file_compare_buffer(compare_target)
+  vim.cmd("edit " .. vim.fn.fnameescape(compare_target))
+  return vim.api.nvim_get_current_buf()
+end
+
 ---@param compare_target string
 ---@param mode "git"|"file"
 local function open_diff(compare_target, mode)
@@ -244,31 +351,18 @@ local function open_diff(compare_target, mode)
 
   vim.cmd(config.split_cmd .. " split")
   local compare_winid = vim.api.nvim_get_current_win()
+  local compare_bufnr
 
   if mode == "git" then
-    local tmp = write_temp_file(source_bufnr, compare_target)
-    if not tmp then
-      pcall(vim.api.nvim_win_close, compare_winid, true)
+    compare_bufnr = open_git_compare_buffer(source_bufnr, compare_target, compare_winid)
+    if not compare_bufnr then
       return
     end
-    state.temp_file = tmp
-    vim.cmd("edit " .. vim.fn.fnameescape(tmp))
-    local compare_bufnr = vim.api.nvim_get_current_buf()
-    sync_compare_buffer_options(source_bufnr, compare_bufnr)
-    vim.api.nvim_set_option_value("readonly", true, { buf = compare_bufnr })
-    vim.api.nvim_set_option_value("modifiable", false, { buf = compare_bufnr })
-    vim.api.nvim_set_option_value("buflisted", false, { buf = compare_bufnr })
-    state.compare_bufnr = compare_bufnr
   else
-    vim.cmd("edit " .. vim.fn.fnameescape(compare_target))
-    state.compare_bufnr = vim.api.nvim_get_current_buf()
+    compare_bufnr = open_file_compare_buffer(compare_target)
   end
 
-  state.source_bufnr = source_bufnr
-  state.source_winid = source_winid
-  state.compare_winid = compare_winid
-  state.active = true
-  state.mode = mode
+  set_active_session(source_bufnr, source_winid, compare_bufnr, compare_winid, mode)
 
   enable_diff_pair(source_winid, compare_winid)
   vim.api.nvim_set_current_win(source_winid)
@@ -295,14 +389,14 @@ end
 
 --- Close the active diff session and clean up
 function M.close_diff()
-  if state.active and state.mode == "git" then
+  if is_active_mode("git") then
     close_session()
   end
 end
 
 --- Toggle diff session on/off
 function M.toggle()
-  if state.active and state.mode == "git" then
+  if is_active_mode("git") then
     M.close_diff()
   else
     M.diff_with_latest()
@@ -312,13 +406,13 @@ end
 --- Check if a diff session is active
 ---@return boolean
 function M.is_active()
-  return state.active and state.mode == "git"
+  return is_active_mode("git")
 end
 
 --- Check if a file diff session is active
 ---@return boolean
 function M.is_file_diff_active()
-  return state.active and state.mode == "file"
+  return is_active_mode("file")
 end
 
 -------------------------------------------------------------------------------
@@ -338,7 +432,7 @@ end
 
 --- Open a diff between the current buffer and a selected file
 function M.diff_with_file()
-  if state.active and state.mode == "file" then
+  if is_active_mode("file") then
     M.close_file_diff()
     return
   end
@@ -359,7 +453,7 @@ end
 
 --- Close the file-to-file diff session
 function M.close_file_diff()
-  if state.active and state.mode == "file" then
+  if is_active_mode("file") then
     close_session()
   end
 end
