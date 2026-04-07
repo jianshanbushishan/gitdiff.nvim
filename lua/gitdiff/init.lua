@@ -18,16 +18,19 @@ local config = {}
 -- State
 -------------------------------------------------------------------------------
 local state = {
+  tabpage = nil,
   source_bufnr = nil,
   source_winid = nil,
   compare_bufnr = nil,
   compare_winid = nil,
   temp_file = nil,
   active = false,
+  visible = false,
   mode = nil, -- "git" | "file"
 }
 
 local closing = false
+local close_session
 
 local compare_buffer_options = {
   "filetype",
@@ -48,6 +51,13 @@ local git_commands = {
   inside_work_tree = { "git", "rev-parse", "--is-inside-work-tree" },
   show_toplevel = { "git", "rev-parse", "--show-toplevel" },
   show_head = { "git", "show" },
+}
+
+local mouse_scroll_mappings = {
+  { lhs = "<ScrollWheelUp>", keys = "<C-Y>" },
+  { lhs = "<ScrollWheelDown>", keys = "<C-E>" },
+  { lhs = "<S-ScrollWheelUp>", keys = "<C-B>" },
+  { lhs = "<S-ScrollWheelDown>", keys = "<C-F>" },
 }
 
 -------------------------------------------------------------------------------
@@ -171,12 +181,14 @@ local function sync_compare_buffer_options(source_bufnr, compare_bufnr)
 end
 
 local function reset_state()
+  state.tabpage = nil
   state.source_bufnr = nil
   state.source_winid = nil
   state.compare_bufnr = nil
   state.compare_winid = nil
   state.temp_file = nil
   state.active = false
+  state.visible = false
   state.mode = nil
 end
 
@@ -212,17 +224,122 @@ local function win_cmd_each(winids, cmd)
   end
 end
 
+---@param bufnr integer|nil
+---@param wins integer[]|nil
+---@return integer|nil
+local function find_window_for_buffer(bufnr, wins)
+  if not is_valid_buf(bufnr) then
+    return nil
+  end
+
+  for _, win in ipairs(wins or vim.api.nvim_tabpage_list_wins(0)) do
+    if is_valid_win(win) and vim.api.nvim_win_get_buf(win) == bufnr then
+      return win
+    end
+  end
+
+  return nil
+end
+
+---@return integer|nil, integer|nil
+local function get_session_windows()
+  local tabpage = state.tabpage
+  local wins
+
+  if tabpage ~= nil and vim.api.nvim_tabpage_is_valid(tabpage) then
+    wins = vim.api.nvim_tabpage_list_wins(tabpage)
+  else
+    wins = vim.api.nvim_tabpage_list_wins(0)
+  end
+
+  local source_winid = find_window_for_buffer(state.source_bufnr, wins)
+  local compare_winid = find_window_for_buffer(state.compare_bufnr, wins)
+  return source_winid, compare_winid
+end
+
+---@return boolean
+local function ensure_session_buffers()
+  if is_valid_buf(state.source_bufnr) and is_valid_buf(state.compare_bufnr) then
+    return true
+  end
+
+  close_session()
+  return false
+end
+
+---@return boolean
+local function has_visible_session()
+  local source_winid, compare_winid = get_session_windows()
+  return is_valid_win(source_winid) and is_valid_win(compare_winid)
+end
+
+---@return integer|nil
+local function get_hovered_diff_win()
+  local ok, mousepos = pcall(vim.fn.getmousepos)
+  local hovered_win = ok and mousepos.winid or nil
+  if is_valid_win(hovered_win)
+    and (hovered_win == state.source_winid or hovered_win == state.compare_winid) then
+    return hovered_win
+  end
+
+  local current_win = vim.api.nvim_get_current_win()
+  if current_win == state.source_winid or current_win == state.compare_winid then
+    return current_win
+  end
+
+  return nil
+end
+
+---@param keys string
+local function scroll_hovered_diff_win(keys)
+  local target_win = get_hovered_diff_win()
+  if not is_valid_win(target_win) then
+    return
+  end
+
+  with_win_call(target_win, function()
+    local termcodes = vim.api.nvim_replace_termcodes(keys, true, false, true)
+    vim.api.nvim_feedkeys(termcodes, "n", false)
+  end)
+end
+
+---@param bufnr integer|nil
+local function clear_mouse_scroll_mappings(bufnr)
+  if not is_valid_buf(bufnr) then
+    return
+  end
+
+  for _, mapping in ipairs(mouse_scroll_mappings) do
+    pcall(vim.keymap.del, "n", mapping.lhs, { buffer = bufnr })
+  end
+end
+
+---@param bufnr integer
+local function set_mouse_scroll_mappings(bufnr)
+  for _, mapping in ipairs(mouse_scroll_mappings) do
+    vim.keymap.set("n", mapping.lhs, function()
+      scroll_hovered_diff_win(mapping.keys)
+    end, {
+      buffer = bufnr,
+      silent = true,
+      desc = "gitdiff hovered mouse scroll",
+    })
+  end
+end
+
 ---@param source_bufnr integer
 ---@param source_winid integer
 ---@param compare_bufnr integer
 ---@param compare_winid integer
 ---@param mode "git"|"file"
 local function set_active_session(source_bufnr, source_winid, compare_bufnr, compare_winid, mode)
+  state.tabpage = vim.api.nvim_get_current_tabpage()
   state.source_bufnr = source_bufnr
   state.source_winid = source_winid
   state.compare_bufnr = compare_bufnr
   state.compare_winid = compare_winid
   state.active = true
+  state.visible = true
   state.mode = mode
 end
 
@@ -278,25 +395,99 @@ local function enable_diff_pair(source_win, compare_win)
   win_cmd_each({ source_win, compare_win }, commands.diff_on)
 end
 
-local function close_session()
+local function suspend_session()
+  if not state.active or closing or not state.visible then
+    return
+  end
+
+  local source_winid, compare_winid = get_session_windows()
+  local compare_bufnr = state.compare_bufnr
+
+  clear_mouse_scroll_mappings(state.source_bufnr)
+  clear_mouse_scroll_mappings(state.compare_bufnr)
+
+  if is_valid_win(source_winid) then
+    clear_diff_for_win(source_winid)
+  end
+  if is_valid_win(compare_winid) then
+    clear_diff_for_win(compare_winid)
+  end
+  if is_valid_win(compare_winid) and vim.api.nvim_win_get_buf(compare_winid) == compare_bufnr then
+    pcall(vim.api.nvim_win_close, compare_winid, true)
+  end
+
+  state.source_winid = nil
+  state.compare_winid = nil
+  state.visible = false
+end
+
+local function resume_session()
+  if not state.active or closing or state.visible then
+    return
+  end
+  if vim.api.nvim_get_current_buf() ~= state.source_bufnr then
+    return
+  end
+  if not ensure_session_buffers() then
+    return
+  end
+
+  local source_winid = vim.api.nvim_get_current_win()
+  local compare_winid = find_window_for_buffer(state.compare_bufnr)
+
+  if compare_winid == source_winid then
+    compare_winid = nil
+  end
+
+  if not is_valid_win(compare_winid) then
+    vim.cmd(config.split_cmd .. " split")
+    compare_winid = vim.api.nvim_get_current_win()
+
+    local ok = pcall(vim.api.nvim_win_set_buf, compare_winid, state.compare_bufnr)
+    if not ok then
+      pcall(vim.api.nvim_win_close, compare_winid, true)
+      return
+    end
+  end
+
+  if state.mode == "git" then
+    sync_compare_buffer_options(state.source_bufnr, state.compare_bufnr)
+    configure_git_compare_buffer(state.compare_bufnr)
+  end
+
+  state.tabpage = vim.api.nvim_get_current_tabpage()
+  state.source_winid = source_winid
+  state.compare_winid = compare_winid
+  state.visible = true
+
+  enable_diff_pair(source_winid, compare_winid)
+  set_mouse_scroll_mappings(state.source_bufnr)
+  set_mouse_scroll_mappings(state.compare_bufnr)
+  vim.api.nvim_set_current_win(source_winid)
+end
+
+close_session = function()
   if not state.active or closing then
     return
   end
 
   closing = true
 
-  local source_winid = state.source_winid
-  local compare_winid = state.compare_winid
+  local source_winid, compare_winid = get_session_windows()
+  local source_bufnr = state.source_bufnr
   local compare_bufnr = state.compare_bufnr
 
-  reset_tab_diff_state()
+  clear_mouse_scroll_mappings(source_bufnr)
+  clear_mouse_scroll_mappings(compare_bufnr)
 
-  if is_valid_win(source_winid) and vim.api.nvim_win_get_buf(source_winid) == state.source_bufnr then
+  if is_valid_win(source_winid) then
     clear_diff_for_win(source_winid)
   end
-  clear_diff_for_win(compare_winid)
-
   if is_valid_win(compare_winid) then
+    clear_diff_for_win(compare_winid)
+  end
+
+  if is_valid_win(compare_winid) and vim.api.nvim_win_get_buf(compare_winid) == compare_bufnr then
     pcall(vim.api.nvim_win_close, compare_winid, true)
   end
 
@@ -365,6 +556,8 @@ local function open_diff(compare_target, mode)
   set_active_session(source_bufnr, source_winid, compare_bufnr, compare_winid, mode)
 
   enable_diff_pair(source_winid, compare_winid)
+  set_mouse_scroll_mappings(source_bufnr)
+  set_mouse_scroll_mappings(compare_bufnr)
   vim.api.nvim_set_current_win(source_winid)
 end
 
@@ -492,11 +685,25 @@ function M.setup(opts)
       if not state.active or closing then
         return
       end
-      if args.buf ~= state.source_bufnr and args.buf ~= state.compare_bufnr then
-        close_session()
+      if args.buf == state.source_bufnr then
+        if not state.visible then
+          resume_session()
+          return
+        end
+        if not has_visible_session() then
+          state.visible = false
+          resume_session()
+        end
+        return
+      end
+      if args.buf == state.compare_bufnr then
+        return
+      end
+      if state.visible then
+        suspend_session()
       end
     end,
-    desc = "Auto-close gitdiff when buffer switches",
+    desc = "Suspend and resume gitdiff when buffer switches",
   })
 
   if config.auto_cleanup then

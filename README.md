@@ -7,7 +7,7 @@
 - **Git HEAD Diff**：将当前缓冲区与 `git show HEAD:<file>` 的内容进行垂直 diff 对比
 - **文件 Diff**：从工作区文件列表中选择一个文件，与当前缓冲区进行 diff 对比
 - **Toggle 模式**：一键开关 Git HEAD diff 会话
-- **自动关闭旧会话**：切换到非当前 diff 会话相关的 buffer 时，会自动关闭旧 diff，避免残留高亮影响下一次对比
+- **会话挂起恢复**：切换到非当前 diff 会话相关的 buffer 时，会收起 diff split 但保留会话；回到原始 buffer 时自动恢复
 - **自动清理**：关闭 Git HEAD diff 时会自动删除临时文件和临时缓冲区；退出 Neovim 时也会清理
 - **互斥保护**：Git HEAD diff 和文件 diff 两种会话互斥，不会同时激活
 
@@ -53,7 +53,8 @@
 
 - Git HEAD diff 使用临时文件作为 compare 侧缓冲区，以保证 diff 结果稳定
 - 新开启 diff 前，会先清理当前 tab 中残留的 diff 状态，避免上一次对比影响下一次对比
-- 当你切换到与当前 diff 无关的 buffer 时，插件会自动关闭旧 diff 会话
+- 当你切换到与当前 diff 无关的 buffer 时，插件会收起 compare 窗口并挂起当前 diff 会话，同时保留对比状态
+- 当你重新回到原始 buffer 时，插件会自动恢复之前的 diff 视图
 - 文件 diff 与 Git HEAD diff 共用同一套会话管理逻辑，同一时刻只会存在一个 diff 会话
 
 ## 命令
